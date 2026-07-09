@@ -58,6 +58,62 @@ jobs:
           clang
 
 
+    - name: Remove embedded KernelSU
+      run: |
+        echo "Removendo KernelSU embutido em drivers/kernelsu..."
+
+        rm -rf drivers/kernelsu
+
+        # Remove a linha "source drivers/kernelsu/Kconfig" do Kconfig dos drivers
+        sed -i '/drivers\/kernelsu\/Kconfig/d' drivers/Kconfig
+
+        # Remove a linha "obj-$(CONFIG_KSU) += kernelsu/" do Makefile dos drivers
+        sed -i '/kernelsu/d' drivers/Makefile
+
+        # Remove qualquer CONFIG_KSU hardcoded no defconfig do dispositivo
+        sed -i '/CONFIG_KSU/d' arch/arm64/configs/vendor/dubai-qgki_defconfig 2>/dev/null || \
+        find . -maxdepth 6 -iname "dubai-qgki_defconfig" \
+          -exec sed -i '/CONFIG_KSU/d' {} \; 2>/dev/null || true
+
+        echo "Conferindo se ainda ha referencias a drivers/kernelsu:"
+        grep -rn "kernelsu" drivers/Makefile drivers/Kconfig || echo "Nenhuma referencia restante."
+
+
+    - name: Install KernelSU-Next
+      run: |
+        curl -LSs \
+          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+          | bash -
+
+
+    - name: Apply SUSFS for KernelSU-Next (kernel 5.4)
+      run: |
+        # susfs4ksu tem uma branch dedicada para kernel 5.4 (non-GKI)
+        git clone --depth=1 --branch kernel-5.4 \
+          https://gitlab.com/simonpunk/susfs4ksu \
+          susfs4ksu
+
+        # Nucleo do SUSFS no kernel (fs/ + include/linux/)
+        cp susfs4ksu/kernel_patches/fs/susfs.c fs/
+        cp susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+        cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
+
+        patch -p1 < 50_add_susfs_in_kernel-5.4.patch || \
+          echo "AVISO: alguns hunks do patch do kernel podem ter falhado, revise manualmente."
+
+        # Integracao do SUSFS especifica para o fork KernelSU-Next
+        curl -LSs \
+          "https://raw.githubusercontent.com/galaxybuild-project/tools/refs/heads/main/Patches/0001susfs157forksunext.patch" \
+          -o ksun_susfs.patch
+
+        cd KernelSU-Next
+        patch -p1 < ../ksun_susfs.patch || \
+          echo "AVISO: alguns hunks do patch do KernelSU-Next podem ter falhado, revise manualmente."
+        cd ..
+
+        rm -f 50_add_susfs_in_kernel-5.4.patch ksun_susfs.patch
+
+
     - name: Configure kernel
       run: |
 
@@ -68,6 +124,24 @@ jobs:
           vendor/dubai-qgki_defconfig
 
 
+    - name: Enable KernelSU-Next & SUSFS configs
+      run: |
+        scripts/config --file out/.config \
+          -e KSU \
+          -e KSU_SUSFS \
+          -e KSU_SUSFS_SUS_PATH \
+          -e KSU_SUSFS_SUS_MOUNT \
+          -e KSU_SUSFS_SUS_KSTAT \
+          -e KSU_SUSFS_TRY_UMOUNT \
+          -e KSU_SUSFS_SPOOF_UNAME \
+          -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+          -e KSU_SUSFS_ENABLE_LOG
+
+        make O=out \
+          ARCH=arm64 \
+          olddefconfig
+
+
     - name: Verify WiFi configs
       run: |
 
@@ -75,6 +149,12 @@ jobs:
 
         grep -E \
         "CFG80211|MAC80211|CNSS|QCA|WLAN|ICNSS" \
+        out/.config || true
+
+        echo "Checking KernelSU-Next / SUSFS configs..."
+
+        grep -E \
+        "CONFIG_KSU|CONFIG_KSU_SUSFS" \
         out/.config || true
 
 

@@ -1,0 +1,164 @@
+name: Atom Dubai Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - topaz-rebase
+
+jobs:
+  build:
+    name: Build Kernel 5.4 Dubai
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: Atom
+      KBUILD_BUILD_HOST: GitHub-Actions
+
+    steps:
+
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        ref: topaz-rebase
+
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+
+        sudo apt install -y \
+          bc \
+          bison \
+          build-essential \
+          ccache \
+          curl \
+          flex \
+          gcc-aarch64-linux-gnu \
+          git \
+          libelf-dev \
+          libssl-dev \
+          python3 \
+          unzip \
+          zip
+
+
+    - name: Setup ccache
+      run: |
+        ccache -M 5G
+
+
+    # Proton Clang para Android kernel 5.4
+    - name: Download Proton Clang
+      run: |
+        git clone --depth=1 \
+          https://github.com/kdrag0n/proton-clang \
+          clang
+
+
+    - name: Configure kernel
+      run: |
+
+        export PATH=$PWD/clang/bin:$PATH
+
+        make O=out \
+          ARCH=arm64 \
+          vendor/dubai-qgki_defconfig
+
+
+    - name: Verify WiFi configs
+      run: |
+
+        echo "Checking WLAN configs..."
+
+        grep -E \
+        "CFG80211|MAC80211|CNSS|QCA|WLAN|ICNSS" \
+        out/.config || true
+
+
+    - name: Build kernel
+      run: |
+
+        export PATH=$PWD/clang/bin:$PATH
+
+        make \
+          -j$(nproc) \
+          O=out \
+          ARCH=arm64 \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          CC=clang \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          STRIP=llvm-strip
+
+
+    - name: Collect kernel output
+      run: |
+
+        mkdir release
+
+        cp out/arch/arm64/boot/Image release/
+
+
+        find out/arch/arm64/boot \
+        -name "*.dtb" \
+        -exec cp {} release/ \; || true
+
+
+        find out/arch/arm64/boot \
+        -name "*.dtbo" \
+        -exec cp {} release/ \; || true
+
+
+
+    - name: Clone AnyKernel3
+      run: |
+
+        git clone --depth=1 \
+        https://github.com/osm0sis/AnyKernel3 \
+        anykernel
+
+
+    - name: Prepare AnyKernel3
+      run: |
+
+        cp release/* anykernel/
+
+
+        cd anykernel
+
+
+        # Edge 30 A/B
+        sed -i \
+        's/do.devicecheck=.*/do.devicecheck=0/' \
+        anykernel.sh || true
+
+
+        sed -i \
+        's/device.name1=.*/device.name1=dubai/' \
+        anykernel.sh || true
+
+
+
+    - name: Build Flashable ZIP
+      run: |
+
+        cd anykernel
+
+        zip -r9 \
+        ../Atom-Dubai-Kernel.zip \
+        . \
+        -x "*.git*"
+
+
+
+    - name: Upload ZIP
+      uses: actions/upload-artifact@v4
+      with:
+
+        name: Atom-Dubai-Kernel
+
+        path: Atom-Dubai-Kernel.zip

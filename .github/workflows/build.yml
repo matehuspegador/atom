@@ -64,8 +64,8 @@ jobs:
 
         rm -rf drivers/kernelsu
 
-        # Remove a linha "source drivers/kernelsu/Kconfig" do Kconfig dos drivers
-        sed -i '/drivers\/kernelsu\/Kconfig/d' drivers/Kconfig
+        # Remove a linha "source drivers/kernelsu/kernel/Kconfig" do Kconfig dos drivers
+        sed -i '/kernelsu/d' drivers/Kconfig
 
         # Remove a linha "obj-$(CONFIG_KSU) += kernelsu/" do Makefile dos drivers
         sed -i '/kernelsu/d' drivers/Makefile

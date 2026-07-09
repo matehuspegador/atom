@@ -1,0 +1,357 @@
+name: Atom Dubai Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - topaz-rebase
+
+jobs:
+  build:
+    name: Build Kernel 5.4 Dubai
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: Atom
+      KBUILD_BUILD_HOST: GitHub-Actions
+
+    steps:
+
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        ref: topaz-rebase
+
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+
+        sudo apt install -y \
+          bc \
+          bison \
+          build-essential \
+          ccache \
+          curl \
+          flex \
+          gcc-aarch64-linux-gnu \
+          git \
+          libelf-dev \
+          libssl-dev \
+          python3 \
+          unzip \
+          zip
+
+
+    - name: Setup ccache
+      run: |
+        ccache -M 5G
+
+
+    # Proton Clang para Android kernel 5.4
+    - name: Download Proton Clang
+      run: |
+        git clone --depth=1 \
+          https://github.com/kdrag0n/proton-clang \
+          clang
+
+
+    - name: Remove embedded KernelSU
+      run: |
+        echo "Removendo KernelSU embutido em drivers/kernelsu..."
+
+        rm -rf drivers/kernelsu
+
+        # Remove a linha "source drivers/kernelsu/kernel/Kconfig" do Kconfig dos drivers
+        sed -i '/kernelsu/d' drivers/Kconfig
+
+        # Remove a linha "obj-$(CONFIG_KSU) += kernelsu/" do Makefile dos drivers
+        sed -i '/kernelsu/d' drivers/Makefile
+
+        # Remove qualquer CONFIG_KSU hardcoded no defconfig do dispositivo
+        sed -i '/CONFIG_KSU/d' arch/arm64/configs/vendor/dubai-qgki_defconfig 2>/dev/null || \
+        find . -maxdepth 6 -iname "dubai-qgki_defconfig" \
+          -exec sed -i '/CONFIG_KSU/d' {} \; 2>/dev/null || true
+
+        echo "Conferindo se ainda ha referencias a drivers/kernelsu:"
+        grep -rn "kernelsu" drivers/Makefile drivers/Kconfig || echo "Nenhuma referencia restante."
+
+
+    - name: Install KernelSU-Next
+      run: |
+        curl -LSs \
+          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+          | bash -
+
+
+    - name: Remove stale manual KernelSU hook call sites
+      run: |
+        python3 - <<'EOF'
+        import re
+
+        def sub_or_die(pattern, repl, text, path, count=1):
+            new_text, n = re.subn(pattern, repl, text, count=count, flags=re.DOTALL)
+            if n == 0:
+                raise SystemExit(f"ERRO: padrao nao encontrado em {path}: {pattern!r}")
+            print(f"{path}: {n} ocorrencia(s) removida(s) para {pattern[:40]!r}...")
+            return new_text
+
+        # fs/open.c
+        path = "fs/open.c"
+        with open(path) as f:
+            text = f.read()
+        text = sub_or_die(r"extern\s+int\s+ksu_handle_faccessat\([^;]*\);\s*\n", "", text, path)
+        text = sub_or_die(r"[ \t]*ksu_handle_faccessat\(&dfd,\s*&filename,\s*&mode,\s*NULL\);\s*\n", "", text, path)
+        with open(path, "w") as f:
+            f.write(text)
+
+        # fs/exec.c
+        path = "fs/exec.c"
+        with open(path) as f:
+            text = f.read()
+        text = sub_or_die(
+            r"extern\s+bool\s+ksu_execveat_hook[^;]*;\s*"
+            r"extern\s+int\s+ksu_handle_execveat\([^;]*\);\s*"
+            r"extern\s+int\s+ksu_handle_execveat_sucompat\([^;]*\);\s*\n",
+            "", text, path)
+        text = sub_or_die(
+            r"[ \t]*if\s*\(unlikely\(ksu_execveat_hook\)\)\s*"
+            r"ksu_handle_execveat\([^;]*\);\s*"
+            r"else\s*"
+            r"ksu_handle_execveat_sucompat\([^;]*\);\s*\n",
+            "", text, path)
+        with open(path, "w") as f:
+            f.write(text)
+
+        # fs/stat.c
+        path = "fs/stat.c"
+        with open(path) as f:
+            text = f.read()
+        text = sub_or_die(r"extern\s+int\s+ksu_handle_stat\([^;]*\);\s*\n", "", text, path)
+        text = sub_or_die(r"[ \t]*ksu_handle_stat\(&dfd,\s*&filename,\s*&flags\);\s*\n", "", text, path)
+        with open(path, "w") as f:
+            f.write(text)
+
+        # fs/read_write.c
+        path = "fs/read_write.c"
+        with open(path) as f:
+            text = f.read()
+        text = sub_or_die(
+            r"extern\s+bool\s+ksu_vfs_read_hook[^;]*;\s*"
+            r"extern\s+int\s+ksu_handle_vfs_read\([^;]*\);\s*\n",
+            "", text, path)
+        text = sub_or_die(
+            r"[ \t]*if\s*\(unlikely\(ksu_vfs_read_hook\)\)\s*"
+            r"ksu_handle_vfs_read\([^;]*\);\s*\n",
+            "", text, path)
+        with open(path, "w") as f:
+            f.write(text)
+
+        print("Todas as remocoes foram aplicadas com sucesso.")
+        EOF
+
+        echo
+        echo "Conferindo se restou alguma referencia:"
+        grep -rn "ksu_handle_faccessat\|ksu_execveat_hook\|ksu_handle_execveat\|ksu_handle_stat\|ksu_vfs_read_hook\|ksu_handle_vfs_read" \
+          fs/exec.c fs/open.c fs/stat.c fs/read_write.c || echo "Nenhuma referencia restante."
+
+
+    - name: Apply SUSFS for KernelSU-Next (kernel 5.4)
+      run: |
+        # Patch especifico para essa arvore de kernel 5.4, deve estar
+        # commitado no repo em patches/susfs_patch_to_5_4.patch
+        PATCH_FILE="patches/susfs_patch_to_5_4.patch"
+
+        if [ ! -f "$PATCH_FILE" ]; then
+          echo "ERRO: $PATCH_FILE nao encontrado no repositorio."
+          echo "Suba o patch para esse caminho antes de rodar o build."
+          exit 1
+        fi
+
+        patch -p1 < "$PATCH_FILE"
+
+
+    - name: Debug KernelSU-Next Kconfig wiring
+      run: |
+        echo "== Linha de source em drivers/Kconfig =="
+        grep -n "kernelsu" drivers/Kconfig || echo "Nenhuma linha 'source' encontrada!"
+
+        echo
+        echo "== Linha de obj em drivers/Makefile =="
+        grep -n "kernelsu" drivers/Makefile || echo "Nenhuma linha 'obj' encontrada!"
+
+        echo
+        echo "== drivers/kernelsu resolvido (symlink?) =="
+        ls -la drivers/kernelsu || echo "drivers/kernelsu nao existe!"
+        readlink -f drivers/kernelsu || true
+
+        echo
+        echo "== Stanza 'config KSU' no Kconfig do driver =="
+        KSU_KCONFIG=$(readlink -f drivers/kernelsu)/Kconfig
+        if [ -f "$KSU_KCONFIG" ]; then
+          grep -A 6 "^config KSU$" "$KSU_KCONFIG" || echo "Simbolo 'config KSU' nao encontrado em $KSU_KCONFIG"
+        else
+          echo "Arquivo $KSU_KCONFIG nao existe!"
+        fi
+
+
+    - name: Configure kernel
+      run: |
+
+        export PATH=$PWD/clang/bin:$PATH
+
+        make O=out \
+          ARCH=arm64 \
+          vendor/dubai-qgki_defconfig
+
+
+    - name: Enable KPROBES/EXT4_FS deps for KernelSU-Next
+      run: |
+        # config KSU depends on KPROBES && EXT4_FS (ver drivers/kernelsu/Kconfig).
+        # Precisa habilitar (e resolver) essa dependencia ANTES de tentar
+        # habilitar KSU, senao o olddefconfig da etapa seguinte derruba o KSU
+        # de volta pra "n" silenciosamente e o build passa "verde" sem KernelSU.
+        scripts/config --file out/.config \
+          -e KPROBES \
+          -e EXT4_FS
+
+        make O=out \
+          ARCH=arm64 \
+          olddefconfig
+
+        echo "Conferindo se KPROBES/EXT4_FS realmente ficaram habilitados:"
+        grep -E "^CONFIG_KPROBES=|^CONFIG_EXT4_FS=" out/.config \
+          || echo "AVISO: KPROBES e/ou EXT4_FS nao aparecem habilitados no .config!"
+
+
+    - name: Enable KernelSU-Next & SUSFS configs
+      run: |
+        scripts/config --file out/.config \
+          -e KSU \
+          -e KSU_SUSFS \
+          -e KSU_SUSFS_SUS_PATH \
+          -e KSU_SUSFS_SUS_MOUNT \
+          -e KSU_SUSFS_SUS_KSTAT \
+          -e KSU_SUSFS_TRY_UMOUNT \
+          -e KSU_SUSFS_SPOOF_UNAME \
+          -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+          -e KSU_SUSFS_ENABLE_LOG
+
+        make O=out \
+          ARCH=arm64 \
+          olddefconfig
+
+
+    - name: Verify KernelSU-Next is actually enabled (fail build otherwise)
+      run: |
+        echo "Checking KernelSU-Next / SUSFS configs..."
+        grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" out/.config || true
+
+        if ! grep -q '^CONFIG_KSU=y' out/.config; then
+          echo
+          echo "ERRO FATAL: CONFIG_KSU nao esta habilitado (=y) no .config final."
+          echo "O olddefconfig provavelmente desligou o KSU por falta de"
+          echo "KPROBES e/ou EXT4_FS. Build abortado de proposito para nao"
+          echo "gerar um zip 'verde' sem KernelSU dentro."
+          exit 1
+        fi
+
+        echo "OK: CONFIG_KSU=y confirmado no .config final."
+
+
+    - name: Verify WiFi configs
+      run: |
+
+        echo "Checking WLAN configs..."
+
+        grep -E \
+        "CFG80211|MAC80211|CNSS|QCA|WLAN|ICNSS" \
+        out/.config || true
+
+
+    - name: Build kernel
+      run: |
+
+        export PATH=$PWD/clang/bin:$PATH
+
+        make \
+          -j$(nproc) \
+          O=out \
+          ARCH=arm64 \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          CC=clang \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          STRIP=llvm-strip
+
+
+    - name: Collect kernel output
+      run: |
+
+        mkdir release
+
+        cp out/arch/arm64/boot/Image release/
+
+
+        find out/arch/arm64/boot \
+        -name "*.dtb" \
+        -exec cp {} release/ \; || true
+
+
+        find out/arch/arm64/boot \
+        -name "*.dtbo" \
+        -exec cp {} release/ \; || true
+
+
+
+    - name: Clone AnyKernel3
+      run: |
+
+        git clone --depth=1 \
+        https://github.com/osm0sis/AnyKernel3 \
+        anykernel
+
+
+    - name: Prepare AnyKernel3
+      run: |
+
+        cp release/* anykernel/
+
+
+        cd anykernel
+
+
+        # Edge 30 A/B
+        sed -i \
+        's/do.devicecheck=.*/do.devicecheck=0/' \
+        anykernel.sh || true
+
+
+        sed -i \
+        's/device.name1=.*/device.name1=dubai/' \
+        anykernel.sh || true
+
+
+
+    - name: Build Flashable ZIP
+      run: |
+
+        cd anykernel
+
+        zip -r9 \
+        ../Atom-Dubai-Kernel.zip \
+        . \
+        -x "*.git*"
+
+
+
+    - name: Upload ZIP
+      uses: actions/upload-artifact@v4
+      with:
+
+        name: Atom-Dubai-Kernel
+
+        path: Atom-Dubai-Kernel.zip

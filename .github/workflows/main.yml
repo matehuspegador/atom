@@ -46,47 +46,41 @@ jobs:
           # CONFIG_KSU=y
           echo -e "\n# KernelSU Next\nCONFIG_KSU=y" >> arch/arm64/configs/vendor/dubai-qgki_defconfig
 
-          # fs/exec.c
+          # Adiciona declarações no TOPO dos arquivos
           echo '#ifdef CONFIG_KSU' >> fs/exec.c
-          echo '__attribute__((hot))' >> fs/exec.c
           echo 'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);' >> fs/exec.c
           echo '#endif' >> fs/exec.c
 
-          sed -i '/do_execveat_common(AT_FDCWD, filename, argv, envp, 0);/i #ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif' fs/exec.c
-          sed -i '/compat_do_execve.*do_execveat_common/i #ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif' fs/exec.c
-
-          # fs/open.c
           echo '#ifdef CONFIG_KSU' >> fs/open.c
-          echo '__attribute__((hot))' >> fs/open.c
           echo 'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);' >> fs/open.c
           echo '#endif' >> fs/open.c
 
-          sed -i '/unsigned int lookup_flags = LOOKUP_FOLLOW;/a #ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif' fs/open.c
-
-          # fs/read_write.c
           echo '#ifdef CONFIG_KSU' >> fs/read_write.c
           echo 'extern bool ksu_vfs_read_hook __read_mostly;' >> fs/read_write.c
-          echo 'extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);' >> fs/read_write.c
+          echo 'extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);' >> fs/read_write.c
           echo '#endif' >> fs/read_write.c
 
-          sed -i '/ssize_t ret = -EBADF;/a #ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook)) \n\t\tksu_handle_sys_read(fd, &buf, &count);\n#endif' fs/read_write.c
-
-          # fs/stat.c
           echo '#ifdef CONFIG_KSU' >> fs/stat.c
-          echo '__attribute__((hot))' >> fs/stat.c
           echo 'extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);' >> fs/stat.c
           echo '#endif' >> fs/stat.c
 
-          sed -i '/error = vfs_fstatat(dfd, filename, &stat, flag);/i #ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif' fs/stat.c
-
-          # kernel/reboot.c
           echo '#ifdef CONFIG_KSU' >> kernel/reboot.c
           echo 'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);' >> kernel/reboot.c
           echo '#endif' >> kernel/reboot.c
 
+          # Aplica as chamadas
+          sed -i '/do_execveat_common(AT_FDCWD, filename, argv, envp, 0);/i #ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif' fs/exec.c
+          sed -i '/compat_do_execve.*do_execveat_common/i #ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif' fs/exec.c
+
+          sed -i '/unsigned int lookup_flags = LOOKUP_FOLLOW;/a #ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif' fs/open.c
+
+          sed -i '/ssize_t ret = -EBADF;/a #ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook)) \n\t\tksu_handle_sys_read(fd, &buf, &count);\n#endif' fs/read_write.c
+
+          sed -i '/error = vfs_fstatat(dfd, filename, &stat, flag);/i #ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif' fs/stat.c
+
           sed -i '/int ret = 0;/a #ifdef CONFIG_KSU \n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif' kernel/reboot.c
 
-          echo "✅ Hooks manuais aplicados!"
+          echo "✅ Hooks aplicados!"
 
       - name: Build Kernel
         run: |
@@ -107,7 +101,7 @@ jobs:
       - name: Verify KernelSU
         run: |
           if grep -q "^CONFIG_KSU=y" out/.config; then
-            echo "✅ KernelSU Next integrado com sucesso!"
+            echo "✅ KernelSU Next integrado!"
           else
             echo "❌ CONFIG_KSU não encontrado!"
             exit 1

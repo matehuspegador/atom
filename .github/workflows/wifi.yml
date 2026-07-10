@@ -1,0 +1,58 @@
+ jobs:
+  compare-wifi:
+    name: Compare WiFi sources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Atom
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Lineage base
+        run: |
+          git clone --depth=1 \
+            -b topaz-wip \
+            https://github.com/SM7325-AE/android_kernel_motorola_dubai.git \
+            base
+
+      - name: Generate diffs
+        shell: bash
+        run: |
+          mkdir -p diff
+
+          compare() {
+            local DIR="$1"
+            local OUT_FILE="diff/$(echo "$DIR" | tr '/' '_').diff"
+
+            if [ -d "base/$DIR" ] && [ -d "$DIR" ]; then
+              # Executa o diff e evita falhar o step se houver diferenças (git diff retorna 1 se achar alterações)
+              git diff --no-index "base/$DIR" "$DIR" > "$OUT_FILE" || [ $? -eq 1 ]
+              
+              # Remove o arquivo se ele estiver completamente vazio (sem diferenças)
+              [ ! -s "$OUT_FILE" ] && rm "$OUT_FILE"
+            fi
+            return 0
+          }
+
+          compare drivers/staging/qcacld-3.0
+          compare drivers/staging/qca-wifi-host-cmn
+          compare drivers/net/wireless/cnss2
+          compare include
+          compare net
+
+      - name: Compare defconfig
+        run: |
+          CONF_PATH="arch/arm64/configs/vendor/dubai-qgki_defconfig"
+          if [ -f "base/$CONF_PATH" ] && [ -f "$CONF_PATH" ]; then
+            git diff --no-index "base/$CONF_PATH" "$CONF_PATH" > diff/dubai-qgki_defconfig.diff || [ $? -eq 1 ]
+            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm diff/dubai-qgki_defconfig.diff
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-comparison
+          path: diff
+          if-no-files-found: warn
+          

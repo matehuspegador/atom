@@ -8,51 +8,81 @@ permissions:
 
 jobs:
   compare-wifi:
-    name: Compare WiFi sources
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Atom
         uses: actions/checkout@v4
-        # fetch-depth: 0 FOI REMOVIDO AQUI (Agora baixa apenas o commit atual, sendo instantâneo)
+        with:
+          fetch-depth: 0
 
-      - name: Clone Lineage base
+      - name: Clone base kernel
         run: |
           git clone --depth=1 \
             -b topaz-wip \
             https://github.com/SM7325-AE/android_kernel_motorola_dubai.git \
             base
 
+      - name: Show repository tree
+        run: |
+          echo "===== Current repo ====="
+          find . -maxdepth 3 -type d | sort
+
+          echo
+          echo "===== Base repo ====="
+          find base -maxdepth 3 -type d | sort
+
       - name: Generate diffs
         shell: bash
         run: |
-          set +e
           mkdir -p diff
 
           compare() {
             DIR="$1"
-            OUT="diff/$(echo "$DIR" | tr '/' '_').diff"
+            OUT="diff/${DIR//\//_}.diff"
 
-            if [ -d "base/$DIR" ] && [ -d "$DIR" ]; then
-              git diff --no-index "base/$DIR" "$DIR" > "$OUT"
-              [ ! -s "$OUT" ] && rm -f "$OUT"
+            if [ ! -d "base/$DIR" ]; then
+              echo "Missing in base: $DIR"
+              return
+            fi
+
+            if [ ! -d "$DIR" ]; then
+              echo "Missing in current repo: $DIR"
+              return
+            fi
+
+            git diff --no-index \
+              "base/$DIR" \
+              "$DIR" \
+              > "$OUT" || true
+
+            if [ ! -s "$OUT" ]; then
+              rm -f "$OUT"
             fi
           }
 
-          compare drivers/staging/qcacld-3.0
-          compare drivers/staging/qca-wifi-host-cmn
-          compare drivers/net/wireless/cnss2
-          compare include
-          compare net
+          compare "drivers/staging/qcacld-3.0"
+          compare "drivers/staging/qca-wifi-host-cmn"
+          compare "drivers/net/wireless/cnss2"
+          compare "include"
+          compare "net"
 
       - name: Compare defconfig
         shell: bash
         run: |
-          CONF=arch/arm64/configs/vendor/dubai-qgki_defconfig
+          CONF="arch/arm64/configs/vendor/dubai-qgki_defconfig"
 
           if [ -f "base/$CONF" ] && [ -f "$CONF" ]; then
-            git diff --no-index "base/$CONF" "$CONF" > diff/dubai-qgki_defconfig.diff
-            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm -f diff/dubai-qgki_defconfig.diff
+            git diff --no-index \
+              "base/$CONF" \
+              "$CONF" \
+              > diff/dubai-qgki_defconfig.diff || true
+
+            if [ ! -s diff/dubai-qgki_defconfig.diff ]; then
+              rm -f diff/dubai-qgki_defconfig.diff
+            fi
+          else
+            echo "Defconfig not found."
           fi
 
       - name: Upload artifacts
@@ -61,4 +91,3 @@ jobs:
           name: wifi-comparison
           path: diff
           if-no-files-found: warn
-          

@@ -1,7 +1,7 @@
 diff --git a/kernel/reboot.c b/kernel/reboot.c
 --- a/kernel/reboot.c
 +++ b/kernel/reboot.c
-@@ -277,6 +277,11 @@ 
+@@ -277,6 +277,12 @@ 
   *
   * reboot doesn't sync: do that yourself before calling this.
   */
@@ -10,12 +10,12 @@ diff --git a/kernel/reboot.c b/kernel/reboot.c
 +extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
 +#endif
 +
-SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-		void __user *, arg)
-{
-	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-	char buffer[256];
-	int ret = 0;
+ SYSCALL_DEFINE4(reboot, int, magic1, int magic2, unsigned int cmd,
+ 		void __user *, arg)
+ {
+@@ -290,6 +296,9 @@ SYSCALL_DEFINE4(reboot, int, magic1, int magic2, unsigned int cmd,
+ 	char buffer[256];
+ 	int ret = 0;
  
 +#ifdef CONFIG_KSU 
 +	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);

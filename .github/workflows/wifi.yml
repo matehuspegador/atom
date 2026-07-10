@@ -1,4 +1,12 @@
- jobs:
+name: Compare WiFi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
   compare-wifi:
     name: Compare WiFi sources
     runs-on: ubuntu-latest
@@ -19,20 +27,17 @@
       - name: Generate diffs
         shell: bash
         run: |
+          set +e
           mkdir -p diff
 
           compare() {
-            local DIR="$1"
-            local OUT_FILE="diff/$(echo "$DIR" | tr '/' '_').diff"
+            DIR="$1"
+            OUT="diff/$(echo "$DIR" | tr '/' '_').diff"
 
             if [ -d "base/$DIR" ] && [ -d "$DIR" ]; then
-              # Executa o diff e evita falhar o step se houver diferenças (git diff retorna 1 se achar alterações)
-              git diff --no-index "base/$DIR" "$DIR" > "$OUT_FILE" || [ $? -eq 1 ]
-              
-              # Remove o arquivo se ele estiver completamente vazio (sem diferenças)
-              [ ! -s "$OUT_FILE" ] && rm "$OUT_FILE"
+              git diff --no-index "base/$DIR" "$DIR" > "$OUT"
+              [ ! -s "$OUT" ] && rm -f "$OUT"
             fi
-            return 0
           }
 
           compare drivers/staging/qcacld-3.0
@@ -42,11 +47,13 @@
           compare net
 
       - name: Compare defconfig
+        shell: bash
         run: |
-          CONF_PATH="arch/arm64/configs/vendor/dubai-qgki_defconfig"
-          if [ -f "base/$CONF_PATH" ] && [ -f "$CONF_PATH" ]; then
-            git diff --no-index "base/$CONF_PATH" "$CONF_PATH" > diff/dubai-qgki_defconfig.diff || [ $? -eq 1 ]
-            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm diff/dubai-qgki_defconfig.diff
+          CONF=arch/arm64/configs/vendor/dubai-qgki_defconfig
+
+          if [ -f "base/$CONF" ] && [ -f "$CONF" ]; then
+            git diff --no-index "base/$CONF" "$CONF" > diff/dubai-qgki_defconfig.diff
+            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm -f diff/dubai-qgki_defconfig.diff
           fi
 
       - name: Upload artifacts
@@ -55,4 +62,3 @@
           name: wifi-comparison
           path: diff
           if-no-files-found: warn
-          

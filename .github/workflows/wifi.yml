@@ -14,8 +14,7 @@ jobs:
     steps:
       - name: Checkout Atom
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        # fetch-depth: 0 FOI REMOVIDO AQUI (Agora baixa apenas o commit atual, sendo instantâneo)
 
       - name: Clone Lineage base
         run: |
@@ -62,3 +61,4 @@ jobs:
           name: wifi-comparison
           path: diff
           if-no-files-found: warn
+          

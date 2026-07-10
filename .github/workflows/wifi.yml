@@ -11,26 +11,47 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Atom
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Clone base kernel
+      - name: Checkout current repo (sparse)
+        shell: bash
         run: |
-          git clone --depth=1 \
-            -b topaz-wip \
+          rm -rf .git
+
+          git init
+          git remote add origin https://github.com/${{ github.repository }}.git
+
+          git config core.sparseCheckout true
+
+          mkdir -p .git/info
+
+          cat > .git/info/sparse-checkout <<'EOF'
+          drivers/staging/qcacld-3.0
+          drivers/staging/qca-wifi-host-cmn
+          drivers/net/wireless/cnss2
+          include
+          net
+          arch/arm64/configs/vendor/dubai-qgki_defconfig
+          EOF
+
+          git fetch --depth=1 origin topaz-rebase
+          git checkout FETCH_HEAD
+
+      - name: Clone base kernel (sparse)
+        shell: bash
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            -b topaz-rebase \
             https://github.com/SM7325-AE/android_kernel_motorola_dubai.git \
             base
 
-      - name: Show repository tree
-        run: |
-          echo "===== Current repo ====="
-          find . -maxdepth 3 -type d | sort
+          cd base
 
-          echo
-          echo "===== Base repo ====="
-          find base -maxdepth 3 -type d | sort
+          git sparse-checkout set \
+            drivers/staging/qcacld-3.0 \
+            drivers/staging/qca-wifi-host-cmn \
+            drivers/net/wireless/cnss2 \
+            include \
+            net \
+            arch/arm64/configs/vendor/dubai-qgki_defconfig
 
       - name: Generate diffs
         shell: bash
@@ -41,36 +62,23 @@ jobs:
             DIR="$1"
             OUT="diff/${DIR//\//_}.diff"
 
-            if [ ! -d "base/$DIR" ]; then
-              echo "Missing in base: $DIR"
-              return
-            fi
+            if [ -d "base/$DIR" ] && [ -d "$DIR" ]; then
+              git diff --no-index \
+                "base/$DIR" \
+                "$DIR" \
+                > "$OUT" || true
 
-            if [ ! -d "$DIR" ]; then
-              echo "Missing in current repo: $DIR"
-              return
-            fi
-
-            git diff --no-index \
-              "base/$DIR" \
-              "$DIR" \
-              > "$OUT" || true
-
-            if [ ! -s "$OUT" ]; then
-              rm -f "$OUT"
+              [ ! -s "$OUT" ] && rm -f "$OUT"
             fi
           }
 
-          compare "drivers/staging/qcacld-3.0"
-          compare "drivers/staging/qca-wifi-host-cmn"
-          compare "drivers/net/wireless/cnss2"
-          compare "include"
-          compare "net"
+          compare drivers/staging/qcacld-3.0
+          compare drivers/staging/qca-wifi-host-cmn
+          compare drivers/net/wireless/cnss2
+          compare include
+          compare net
 
-      - name: Compare defconfig
-        shell: bash
-        run: |
-          CONF="arch/arm64/configs/vendor/dubai-qgki_defconfig"
+          CONF=arch/arm64/configs/vendor/dubai-qgki_defconfig
 
           if [ -f "base/$CONF" ] && [ -f "$CONF" ]; then
             git diff --no-index \
@@ -78,11 +86,7 @@ jobs:
               "$CONF" \
               > diff/dubai-qgki_defconfig.diff || true
 
-            if [ ! -s diff/dubai-qgki_defconfig.diff ]; then
-              rm -f diff/dubai-qgki_defconfig.diff
-            fi
-          else
-            echo "Defconfig not found."
+            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm -f diff/dubai-qgki_defconfig.diff
           fi
 
       - name: Upload artifacts

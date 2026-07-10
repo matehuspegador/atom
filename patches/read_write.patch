@@ -1,6 +1,7 @@
+diff --git a/fs/read_write.c b/fs/read_write.c
 --- a/fs/read_write.c
 +++ b/fs/read_write.c
-@@ -568,11 +568,21 @@ static inline void file_pos_write(struct file *file, loff_t pos)
+@@ -568,6 +568,13 @@ static inline void file_pos_write(struct file *file, loff_t pos)
  		file->f_pos = pos;
  }
  
@@ -13,6 +14,7 @@
  SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
  {
  	struct fd f = fdget_pos(fd);
+@@ -575,6 +582,10 @@ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
  	ssize_t ret = -EBADF;
  
 +#ifdef CONFIG_KSU

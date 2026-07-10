@@ -7,38 +7,29 @@ permissions:
   contents: read
 
 jobs:
-  compare-wifi:
+  compare:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout current repo (sparse)
-        shell: bash
+      - name: Checkout current repository (sparse)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            drivers/staging/qcacld-3.0
+            drivers/staging/qca-wifi-host-cmn
+            drivers/net/wireless/cnss2
+            include
+            net
+            arch/arm64/configs/vendor
+
+      - name: Clone base kernel
         run: |
-          rm -rf .git
-
-          git init
-          git remote add origin https://github.com/${{ github.repository }}.git
-
-          git config core.sparseCheckout true
-
-          mkdir -p .git/info
-
-          cat > .git/info/sparse-checkout <<'EOF'
-          drivers/staging/qcacld-3.0
-          drivers/staging/qca-wifi-host-cmn
-          drivers/net/wireless/cnss2
-          include
-          net
-          arch/arm64/configs/vendor/dubai-qgki_defconfig
-          EOF
-
-          git fetch --depth=1 origin topaz-rebase
-          git checkout FETCH_HEAD
-
-      - name: Clone base kernel (sparse)
-        shell: bash
-        run: |
-          git clone --depth=1 --filter=blob:none --sparse \
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --sparse \
             -b topaz-rebase \
             https://github.com/SM7325-AE/android_kernel_motorola_dubai.git \
             base
@@ -51,7 +42,7 @@ jobs:
             drivers/net/wireless/cnss2 \
             include \
             net \
-            arch/arm64/configs/vendor/dubai-qgki_defconfig
+            arch/arm64/configs/vendor
 
       - name: Generate diffs
         shell: bash
@@ -59,16 +50,18 @@ jobs:
           mkdir -p diff
 
           compare() {
-            DIR="$1"
-            OUT="diff/${DIR//\//_}.diff"
+            SRC="base/$1"
+            DST="$1"
+            OUT="diff/${1//\//_}.diff"
 
-            if [ -d "base/$DIR" ] && [ -d "$DIR" ]; then
-              git diff --no-index \
-                "base/$DIR" \
-                "$DIR" \
-                > "$OUT" || true
+            if [ -e "$SRC" ] && [ -e "$DST" ]; then
+              git diff --no-index "$SRC" "$DST" > "$OUT" || true
 
-              [ ! -s "$OUT" ] && rm -f "$OUT"
+              if [ ! -s "$OUT" ]; then
+                rm -f "$OUT"
+              fi
+            else
+              echo "Skipping $1"
             fi
           }
 
@@ -77,17 +70,7 @@ jobs:
           compare drivers/net/wireless/cnss2
           compare include
           compare net
-
-          CONF=arch/arm64/configs/vendor/dubai-qgki_defconfig
-
-          if [ -f "base/$CONF" ] && [ -f "$CONF" ]; then
-            git diff --no-index \
-              "base/$CONF" \
-              "$CONF" \
-              > diff/dubai-qgki_defconfig.diff || true
-
-            [ ! -s diff/dubai-qgki_defconfig.diff ] && rm -f diff/dubai-qgki_defconfig.diff
-          fi
+          compare arch/arm64/configs/vendor/dubai-qgki_defconfig
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

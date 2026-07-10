@@ -50,18 +50,12 @@ jobs:
           echo "📥 Instalando KernelSU Next (Legacy)..."
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-          # Garantia extra para kernels 5.4
-          echo "🔧 Verificando Kconfig..."
+          # Força inclusão do Kconfig (kernels 5.4)
           if [ -f drivers/kernelsu/kernel/Kconfig ]; then
-            echo "✅ Kconfig encontrado em drivers/kernelsu/kernel/Kconfig"
-            
-            # Força inclusão do Kconfig se o setup.sh não fez
             if ! grep -q "kernelsu/kernel/Kconfig" drivers/Kconfig; then
               sed -i '/endmenu/i\source "drivers/kernelsu/kernel/Kconfig"' drivers/Kconfig
-              echo "✅ Kconfig incluído manualmente"
+              echo "✅ Kconfig do KernelSU Next incluído manualmente"
             fi
-          else
-            echo "⚠️ Kconfig não encontrado!"
           fi
 
       # ==================== BUILD ====================
@@ -69,24 +63,49 @@ jobs:
         run: |
           export PATH="$(pwd)/clang/bin:$PATH"
           
+          echo "🔧 Gerando defconfig..."
           make O=out ARCH=arm64 vendor/dubai-qgki_defconfig \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
-          echo "🚀 Compilando com KernelSU Next..."
+          echo "🚀 Iniciando compilação..."
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- 2>&1 | tee build.log
 
-      - name: Pack AnyKernel
+      # ==================== VERIFICAÇÃO OBRIGATÓRIA DO KERNELSU ====================
+      - name: Verify KernelSU Next Inclusion
+        run: |
+          echo "🔍 Verificando se KernelSU Next foi incluído corretamente..."
+          
+          if [ ! -f out/.config ]; then
+            echo "❌ Erro: .config não encontrado!"
+            exit 1
+          fi
+
+          KSU_STATUS=$(grep "^CONFIG_KSU=" out/.config | cut -d'=' -f2 || echo "MISSING")
+          
+          echo "CONFIG_KSU = $KSU_STATUS"
+          
+          if [ "$KSU_STATUS" = "y" ]; then
+            echo "✅ KernelSU Next incluído com sucesso!"
+          else
+            echo "❌ FALHA CRÍTICA: KernelSU Next NÃO foi incluído no kernel!"
+            echo "Verifique o setup do Kconfig e hooks."
+            exit 1  # Faz o build falhar
+          fi
+
+      # ==================== PACK ====================
+      - name: Pack AnyKernel3
         run: ./build.sh
 
-      - name: Upload Kernel
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AtomX-Dubai-KSU-Next-Legacy
+          name: AtomX-Dubai-KernelSU-Next-Legacy
           path: "*.zip"
+          if-no-files-found: error

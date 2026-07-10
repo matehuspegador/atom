@@ -1,0 +1,451 @@
+name: Build AtomX Kernel (KernelSU-Next legacy)
+
+# ---------------------------------------------------------------------------
+# This workflow:
+#   1. Checks out the kernel source
+#   2. Deletes the old drivers/kernelsu (legacy KernelSU) driver
+#   3. Fetches KernelSU-Next using its "legacy" (manual-hook) setup, which is
+#      the supported path for pre-GKI / 5.4-class kernels
+#   4. Flips the defconfig to manual-hook mode (kprobes off, CONFIG_KSU on)
+#   5. Best-effort auto-patches the manual hooks that KernelSU-Next needs
+#      (fs/exec.c, fs/read_write.c, fs/devpts/inode.c, drivers/input/input.c)
+#   6. Builds the kernel and uploads Image/dtbo as artifacts
+#
+# IMPORTANT — read before running:
+#   - The defconfig path/name and build command below are best guesses based
+#     on the file names visible in the repo (build.config.msm.lahaina, the
+#     arch/arm64/configs tree, build.sh). Confirm/adjust the `defconfig` and
+#     `build_config` workflow inputs for your actual target before running.
+#   - The auto-patch step is anchor-based (it looks for known, stable lines
+#     from the official KernelSU non-GKI guide) so it survives most kernel
+#     trees, but it is NOT a substitute for reviewing the diff it produces.
+#     The job uploads a patch-report.txt artifact — check it.
+#   - Two things this workflow does NOT attempt automatically, because they
+#     are too version-specific to patch blindly (see the "Manual hooks still
+#     needed" section printed in the build log):
+#       a) fs/stat.c / do_faccessat sucompat hook (ksu_handle_stat)
+#       b) backporting path_umount to fs/namespace.c (only needed if you
+#          want the KernelSU "module umount" feature on a kernel < 5.9)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name, no _defconfig suffix"
+        required: true
+        default: "vendor/dubai-qgki"
+      arch:
+        description: "Kernel arch"
+        required: true
+        default: "arm64"
+      ksu_ref:
+        description: "KernelSU-Next setup.sh ref to use (legacy = manual-hook path for old/5.4-class kernels)"
+        required: true
+        default: "legacy"
+      build_config:
+        description: "build.config.* file to pass to build.sh (leave blank to fall back to plain make — confirm the right build.config.* for dubai/SM7325 in the repo before setting this)"
+        required: false
+        default: ""
+      clang_repo:
+        description: "Proton Clang source. kdrag0n's original is frozen/archived, which is exactly why it's the recommended pick for 5.4-class kernels — it stopped updating right around the LLVM version most CAF/QGKI 5.4 trees were validated against. Newer clang releases are more likely to choke on old kernel C."
+        required: true
+        default: "https://github.com/kdrag0n/proton-clang"
+  push:
+    branches: [ topaz-rebase ]
+
+env:
+  KSU_SETUP_URL: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            git libncurses-dev libssl-dev python3 rsync unzip zip \
+            libelf-dev lz4 dwarves device-tree-compiler
+
+      - name: Fetch Proton Clang toolchain
+        run: |
+          set -e
+          git clone --depth=1 "${{ github.event.inputs.clang_repo || 'https://github.com/kdrag0n/proton-clang' }}" "$GITHUB_WORKSPACE/proton-clang"
+
+          CLANG_BIN="$GITHUB_WORKSPACE/proton-clang/bin"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/proton-clang/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+          # Old (pre-5.9) CAF/QGKI Makefiles look for CROSS_COMPILE_ARM32;
+          # kernels 4.19+ use the upstream CROSS_COMPILE_COMPAT name instead.
+          # Set both so whichever this tree expects is covered.
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=$GITHUB_WORKSPACE/proton-clang/bin/aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/proton-clang/bin/arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_COMPAT=$GITHUB_WORKSPACE/proton-clang/bin/arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "AR=llvm-ar" >> "$GITHUB_ENV"
+          echo "NM=llvm-nm" >> "$GITHUB_ENV"
+          echo "OBJCOPY=llvm-objcopy" >> "$GITHUB_ENV"
+          echo "OBJDUMP=llvm-objdump" >> "$GITHUB_ENV"
+          echo "STRIP=llvm-strip" >> "$GITHUB_ENV"
+
+          {
+            echo "## Toolchain"
+            echo
+            echo "Using \`${{ github.event.inputs.clang_repo || 'https://github.com/kdrag0n/proton-clang' }}\`:"
+            echo '```'
+            "$CLANG_BIN/clang" --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove legacy KernelSU driver (drivers/kernelsu)
+        run: |
+          set -e
+          if [ -d drivers/kernelsu ] || [ -L drivers/kernelsu ]; then
+            echo "Removing existing drivers/kernelsu ..."
+            rm -rf drivers/kernelsu
+          else
+            echo "No drivers/kernelsu present, nothing to remove."
+          fi
+
+          # Strip old KernelSU references from drivers/Kconfig and drivers/Makefile
+          # so the tree doesn't try to build/link a directory that no longer exists.
+          for f in drivers/Kconfig drivers/Makefile; do
+            if [ -f "$f" ]; then
+              cp "$f" "$f.bak"
+              grep -inE 'kernelsu|CONFIG_KSU' "$f" > "$f.removed.txt" || true
+              sed -i '/kernelsu/Id' "$f"
+              sed -i '/CONFIG_KSU\b/Id' "$f"
+              echo "---- lines stripped from $f ----"
+              cat "$f.removed.txt" || true
+            fi
+          done
+
+      - name: Fetch KernelSU-Next (legacy / manual-hook setup)
+        run: |
+          set -e
+          curl -LSs "$KSU_SETUP_URL" | bash -s ${{ github.event.inputs.ksu_ref || 'legacy' }}
+          echo "KernelSU-Next added at:"
+          ls -la KernelSU-Next 2>/dev/null || ls -la drivers/kernelsu 2>/dev/null || true
+
+      - name: Discover defconfig & build layout (no terminal needed — read this in the Summary tab)
+        id: discover
+        run: |
+          set -e
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          WANTED="${{ github.event.inputs.defconfig || 'vendor/dubai-qgki' }}"
+          WANTED_PATH="arch/${ARCH}/configs/${WANTED}_defconfig"
+
+          {
+            echo "## Kernel build layout discovery"
+            echo
+            echo "Requested defconfig: \`${WANTED}_defconfig\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$WANTED_PATH" ]; then
+            FOUND_PATH="$WANTED_PATH"
+            echo "Found requested defconfig at \`$FOUND_PATH\` ✅" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ Not found at \`$WANTED_PATH\` — searching the tree for anything matching *dubai*..." >> "$GITHUB_STEP_SUMMARY"
+            # Try to auto-match a dubai/qgki defconfig anywhere under arch/*/configs
+            CANDIDATE=$(find arch -type f -iname "*dubai*defconfig*" 2>/dev/null | head -n1 || true)
+            if [ -z "$CANDIDATE" ]; then
+              CANDIDATE=$(find arch -type f -iname "*defconfig*" 2>/dev/null | grep -i qgki | head -n1 || true)
+            fi
+            if [ -n "$CANDIDATE" ]; then
+              FOUND_PATH="$CANDIDATE"
+              echo "Auto-detected candidate defconfig: \`$FOUND_PATH\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "❌ Could not auto-detect any defconfig. Every defconfig-like file found in the repo:" >> "$GITHUB_STEP_SUMMARY"
+              find arch -iname "*defconfig*" 2>/dev/null | sed 's/^/- `/;s/$/`/' >> "$GITHUB_STEP_SUMMARY" || true
+              echo "::error::No defconfig found. Open this run's Summary tab, pick the right path from the list, and re-run with the 'defconfig' input set to that path (relative to arch/<ARCH>/configs, without the _defconfig suffix)."
+              exit 1
+            fi
+          fi
+
+          echo "defconfig_path=${FOUND_PATH}" >> "$GITHUB_OUTPUT"
+
+          # QGKI kernels often need fragments merged via scripts/gki/generate_defconfig.sh
+          # before the defconfig is complete — detect and note that.
+          if [ -f scripts/gki/generate_defconfig.sh ]; then
+            echo "Detected \`scripts/gki/generate_defconfig.sh\` (QGKI fragment generator) — will run it before building." >> "$GITHUB_STEP_SUMMARY"
+            echo "has_generate_defconfig=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_generate_defconfig=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Look for a build.sh + build.config.* pair (common in QCOM/CAF-derived trees)
+          BC=$(find . -maxdepth 1 -iname "build.config*" 2>/dev/null | grep -iE 'dubai|qgki' | head -n1 || true)
+          if [ -z "$BC" ]; then
+            BC=$(find . -maxdepth 1 -iname "build.config*" 2>/dev/null | head -n1 || true)
+          fi
+          if [ -n "$BC" ] && [ -x build.sh ]; then
+            echo "Detected build script: \`build.sh\` with \`${BC#./}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "build_config=${BC#./}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No build.sh/build.config.* pair detected — will fall back to plain \`make\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "build_config=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enable manual-hook mode in defconfig
+        run: |
+          set -e
+          DEFCONFIG_PATH="${{ steps.discover.outputs.defconfig_path }}"
+
+          echo "Patching $DEFCONFIG_PATH"
+          cp "$DEFCONFIG_PATH" "$DEFCONFIG_PATH.bak"
+
+          set_cfg() {
+            local key="$1" val="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG_PATH"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG_PATH"
+            echo "${key}=${val}" >> "$DEFCONFIG_PATH"
+          }
+          unset_cfg() {
+            local key="$1"
+            sed -i "/^${key}=/d" "$DEFCONFIG_PATH"
+            echo "# ${key} is not set" >> "$DEFCONFIG_PATH"
+          }
+
+          set_cfg CONFIG_KSU y
+          set_cfg CONFIG_KSU_MANUAL_HOOK y
+          # Manual hooks + kprobes enabled at the same time is what causes the
+          # boot loops reported for 5.4-class kernels — keep kprobes off.
+          unset_cfg CONFIG_KPROBES
+          unset_cfg CONFIG_KPROBE_EVENTS
+          unset_cfg CONFIG_HAVE_KPROBES
+
+          echo "---- diff ----"
+          diff -u "$DEFCONFIG_PATH.bak" "$DEFCONFIG_PATH" || true
+
+      - name: Auto-patch manual KernelSU-Next hooks
+        run: |
+          set -e
+          cat > /tmp/apply_ksu_hooks.py <<'PYEOF'
+          import re, sys, pathlib
+
+          REPORT = []
+
+          def patch_file(path, marker, anchor_regex, extern_block, call_block, insert_mode="after_anchor_line"):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  REPORT.append(f"SKIP  {path}: file not found")
+                  return
+              text = p.read_text()
+              if marker in text:
+                  REPORT.append(f"SKIP  {path}: already patched")
+                  return
+
+              m = re.search(anchor_regex, text)
+              if not m:
+                  REPORT.append(f"FAIL  {path}: anchor pattern not found, needs manual hook -> {anchor_regex}")
+                  return
+
+              if insert_mode == "before_line":
+                  # anchor_regex is expected to end at the opening brace "{" of the
+                  # function body. Insert the extern block before the line containing
+                  # the match, and the call block right after that "{".
+                  line_start = text.rfind("\n", 0, m.start()) + 1
+                  new_text = text[:line_start] + extern_block + text[line_start:]
+                  m2 = re.search(anchor_regex, new_text)
+                  insert_at = m2.end()
+                  new_text = new_text[:insert_at] + "\n" + call_block + new_text[insert_at:]
+              elif insert_mode == "after_anchor_line":
+                  # anchor_regex is expected to match the whole anchor line, including
+                  # its trailing newline. Insert extern block before that line and the
+                  # call block right after it.
+                  line_start = text.rfind("\n", 0, m.start()) + 1
+                  line_end = m.end()
+                  new_text = text[:line_start] + extern_block + text[line_start:line_end] + call_block + text[line_end:]
+              else:
+                  REPORT.append(f"FAIL  {path}: unknown insert_mode")
+                  return
+
+              p.write_text(new_text)
+              REPORT.append(f"OK    {path}: hook inserted")
+
+
+          # 1. fs/exec.c -- su + app-profile execve hook
+          patch_file(
+              "fs/exec.c",
+              marker="ksu_handle_execveat",
+              anchor_regex=r"static int do_execveat_common\([^\)]*\)\s*\n\{",
+              extern_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "extern bool ksu_execveat_hook __read_mostly;\n"
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+                  "\t\t\t\tvoid *envp, int *flags);\n"
+                  "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
+                  "\t\t\t\tvoid *argv, void *envp, int *flags);\n"
+                  "#endif\n"
+              ),
+              call_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "\tif (unlikely(ksu_execveat_hook))\n"
+                  "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                  "\telse\n"
+                  "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
+                  "#endif\n"
+              ),
+              insert_mode="before_line",
+          )
+
+          # 2. fs/read_write.c -- su compat for `read` syscall
+          patch_file(
+              "fs/read_write.c",
+              marker="ksu_handle_sys_read",
+              anchor_regex=r"[ \t]*ssize_t ret = -EBADF;\n",
+              extern_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                  "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
+                  "#endif\n"
+              ),
+              call_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "\tif (unlikely(ksu_vfs_read_hook))\n"
+                  "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+                  "#endif\n"
+              ),
+              insert_mode="after_anchor_line",
+          )
+
+          # 3. fs/devpts/inode.c -- sucompat pty handling
+          patch_file(
+              "fs/devpts/inode.c",
+              marker="ksu_handle_devpts",
+              anchor_regex=r"void \*devpts_get_priv\(struct dentry \*dentry\)\s*\n\{",
+              extern_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "extern int ksu_handle_devpts(struct inode *inode);\n"
+                  "#endif\n"
+              ),
+              call_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_devpts(dentry->d_inode);\n"
+                  "#endif\n"
+              ),
+              insert_mode="before_line",
+          )
+
+          # 4. drivers/input/input.c -- Safe Mode (hold volume-down at boot)
+          patch_file(
+              "drivers/input/input.c",
+              marker="ksu_handle_input_handle_event",
+              anchor_regex=r"static void input_handle_event\(struct input_dev \*dev, unsigned int type,\s*\n?\s*unsigned int code, int value\)\s*\n\{",
+              extern_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "extern bool ksu_input_hook __read_mostly;\n"
+                  "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                  "#endif\n"
+              ),
+              call_block=(
+                  "#ifdef CONFIG_KSU\n"
+                  "\tif (unlikely(ksu_input_hook))\n"
+                  "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                  "#endif\n"
+              ),
+              insert_mode="before_line",
+          )
+
+          report_path = "/tmp/patch-report.txt"
+          pathlib.Path(report_path).write_text("\n".join(REPORT) + "\n")
+          print("\n".join(REPORT))
+
+          failures = [r for r in REPORT if r.startswith("FAIL")]
+          if failures:
+              print("\n::warning::Some hooks could not be auto-patched -- apply them manually, see patch-report.txt")
+
+          PYEOF
+          python3 /tmp/apply_ksu_hooks.py
+          cp /tmp/patch-report.txt patch-report.txt
+
+      - name: Remaining manual hooks (informational)
+        run: |
+          cat <<'EOF'
+          The following are NOT auto-patched by this workflow and, per the
+          official KernelSU non-GKI guide, must be reviewed/applied by hand
+          if you need them:
+
+            * fs/stat.c (or wherever your tree implements faccessat/newfstatat)
+              -> ksu_handle_stat, for `su` path spoofing under sucompat.
+            * fs/namespace.c -> backport path_umount from 5.9+ if you want the
+              KernelSU "module umount" feature on this < 5.9 tree.
+
+          See: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+          EOF
+
+      - name: Build kernel
+        run: |
+          set -e
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          DEFCONFIG_PATH="${{ steps.discover.outputs.defconfig_path }}"
+          DEFCONFIG_NAME="$(basename "$DEFCONFIG_PATH" _defconfig)"
+          HAS_GENERATE_DEFCONFIG="${{ steps.discover.outputs.has_generate_defconfig }}"
+          BUILD_CONFIG="${{ github.event.inputs.build_config }}"
+          if [ -z "$BUILD_CONFIG" ]; then
+            BUILD_CONFIG="${{ steps.discover.outputs.build_config }}"
+          fi
+
+          # Figure out the defconfig argument the way `make` expects it,
+          # i.e. relative to arch/$ARCH/configs, e.g. "vendor/dubai-qgki_defconfig".
+          DEFCONFIG_ARG="${DEFCONFIG_PATH#arch/$ARCH/configs/}"
+
+          # CC/CROSS_COMPILE/etc. are already exported globally via $GITHUB_ENV
+          # from the "Fetch Proton Clang toolchain" step, so build.sh inherits
+          # them too. We still pass them explicitly to `make` as a safety net,
+          # since some old CAF Makefiles only honor command-line overrides.
+          MAKE_TOOLCHAIN_ARGS=(
+            "CC=$CC"
+            "CROSS_COMPILE=$CROSS_COMPILE"
+            "CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32"
+            "CROSS_COMPILE_COMPAT=$CROSS_COMPILE_COMPAT"
+            "AR=$AR" "NM=$NM" "OBJCOPY=$OBJCOPY" "OBJDUMP=$OBJDUMP" "STRIP=$STRIP"
+          )
+
+          if [ -n "$BUILD_CONFIG" ] && [ -x build.sh ]; then
+            echo "Building via build.sh with BUILD_CONFIG=$BUILD_CONFIG"
+            BUILD_CONFIG="$BUILD_CONFIG" ./build.sh
+          else
+            echo "No build.sh/build.config pair — using plain make with $DEFCONFIG_ARG"
+            if [ "$HAS_GENERATE_DEFCONFIG" = "true" ]; then
+              echo "Running scripts/gki/generate_defconfig.sh to merge QGKI fragments first"
+              ARCH="$ARCH" scripts/gki/generate_defconfig.sh "$DEFCONFIG_ARG" || \
+                echo "::warning::generate_defconfig.sh failed or isn't needed for this tree — continuing with make directly"
+            fi
+            make ARCH="$ARCH" O=out "${MAKE_TOOLCHAIN_ARGS[@]}" "$DEFCONFIG_ARG"
+            make ARCH="$ARCH" O=out "${MAKE_TOOLCHAIN_ARGS[@]}" -j"$(nproc)"
+          fi
+
+      - name: Locate build outputs
+        id: outputs
+        run: |
+          {
+            echo "found<<EOF"
+            find out -maxdepth 4 \( -iname "Image*" -o -iname "*.dtb" -o -iname "*.dtbo" \) 2>/dev/null || true
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomx-kernel-kernelsu-next-legacy
+          path: |
+            out/**/Image*
+            out/**/*.dtb
+            out/**/*.dtbo
+            patch-report.txt
+          if-no-files-found: warn
